@@ -1,0 +1,22 @@
+"""
+Test minimal - vérifie que Spark démarre correctement avec Java.
+Si ce script tourne sans erreur, l'installation est complète et validée.
+"""
+
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .appName("TestSpark") \
+    .master("local[*]") \
+    .getOrCreate()
+
+print("Spark démarré avec succès !")
+print(f"Version Spark : {spark.version}")
+
+# Petit test concret : créer un mini DataFrame et l'afficher
+data = [("Transaction test", 100.0), ("Autre transaction", 250.5)]
+df = spark.createDataFrame(data, ["description", "montant"])
+df.show()
+
+spark.stop()
+print("Test terminé, Spark arrêté proprement.")
