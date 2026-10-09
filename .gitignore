@@ -1,2 +1,4 @@
 *.csv 
 *.joblib 
+stream_results/ 
+__pycache__/ 

@@ -1,475 +1,710 @@
 """
-Interface graphique (Streamlit) pour visualiser les performances du
-modèle de détection de fraude, et tester des transactions manuellement.
+REAL-TIME FRAUD DETECTION DASHBOARD
 
-Lancement :
-streamlit run dashboard.py
+Kafka
+  ↓
+Spark Structured Streaming
+  ↓
+Random Forest
+  ↓
+fichiers_generes/stream_results/batch_*.csv
+  ↓
+Streamlit
 """
 
 import os
-import streamlit as st
-import pandas as pd
-import numpy as np
-import joblib
-import matplotlib.pyplot as plt
-import seaborn as sns
+import glob
+import time
+import re
 
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    confusion_matrix,
-    precision_recall_curve
+import pandas as pd
+import streamlit as st
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+RESULTS_DIR = os.path.join(
+    BASE_DIR,
+    "stream_results"
 )
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# ============================================================================
+# PAGE
+# ============================================================================
 
 st.set_page_config(
-    page_title="Détection de fraude - Dashboard",
+    page_title="Real-Time Fraud Detection",
+    page_icon="🚨",
     layout="wide"
 )
 
-MODEL_PATH = "fraud_model_final.joblib"
-THRESHOLD_PATH = "best_threshold.txt"
-TEST_PATH = "transactions_test.csv"
+
+# ============================================================================
+# STYLE
+# ============================================================================
+
+st.markdown(
+    """
+    <style>
+
+    .main-title {
+        font-size: 42px;
+        font-weight: bold;
+        text-align: center;
+        margin-bottom: 5px;
+    }
+
+    .subtitle {
+        text-align: center;
+        font-size: 18px;
+        color: #777;
+        margin-bottom: 25px;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 
-# ============================================================
-# FEATURE ENGINEERING
-# ============================================================
+# ============================================================================
+# TITRE
+# ============================================================================
 
-def add_features(df):
-    df = df.copy()
+st.markdown(
+    '<div class="main-title">🚨 REAL-TIME FRAUD DETECTION</div>',
+    unsafe_allow_html=True
+)
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
+st.markdown(
+    '<div class="subtitle">'
+    'Kafka → Spark Structured Streaming → Random Forest → Dashboard'
+    '</div>',
+    unsafe_allow_html=True
+)
 
-    df["hour_of_day"] = df["timestamp"].dt.hour
 
-    df["is_night"] = (
-        df["hour_of_day"].between(0, 4)
-    ).astype(int)
+# ============================================================================
+# SIDEBAR
+# ============================================================================
 
-    df = df.sort_values(
-        ["user_id", "timestamp"]
-    ).reset_index(drop=True)
+st.sidebar.title("⚙️ Contrôle")
 
-    df_indexed = df.set_index("timestamp")
+auto_refresh = st.sidebar.checkbox(
+    "🔄 Actualisation automatique",
+    value=True
+)
 
-    velocity = (
-        df_indexed
-        .groupby("user_id")["transaction_id"]
-        .rolling("5min")
-        .count()
+refresh_seconds = st.sidebar.slider(
+    "Intervalle de rafraîchissement",
+    min_value=1,
+    max_value=10,
+    value=2
+)
+
+show_only_fraud = st.sidebar.checkbox(
+    "🚨 Afficher uniquement les fraudes",
+    value=False
+)
+
+
+# ============================================================================
+# CHARGER TOUS LES BATCHES
+# ============================================================================
+
+def get_batch_files():
+
+    files = glob.glob(
+        os.path.join(
+            RESULTS_DIR,
+            "batch_*.csv"
+        )
     )
 
-    df["velocity_count_5min"] = (
-        velocity
-        .reset_index(level=0, drop=True)
-        .values
+    def batch_number(path):
+
+        filename = os.path.basename(path)
+
+        match = re.search(
+            r"batch_(\d+)\.csv",
+            filename
+        )
+
+        if match:
+            return int(match.group(1))
+
+        return -1
+
+    files.sort(key=batch_number)
+
+    return files
+
+
+def load_results():
+
+    files = get_batch_files()
+
+    if not files:
+        return pd.DataFrame(), [], -1
+
+    dataframes = []
+
+    for file in files:
+
+        try:
+
+            df_batch = pd.read_csv(file)
+
+            # Ajouter le numéro du batch
+            filename = os.path.basename(file)
+
+            match = re.search(
+                r"batch_(\d+)\.csv",
+                filename
+            )
+
+            if match:
+                batch_id = int(match.group(1))
+            else:
+                batch_id = -1
+
+            df_batch["batch_id"] = batch_id
+
+            dataframes.append(df_batch)
+
+        except Exception as e:
+
+            print(
+                f"Erreur lecture {file}: {e}"
+            )
+
+    if not dataframes:
+
+        return pd.DataFrame(), files, -1
+
+    df = pd.concat(
+        dataframes,
+        ignore_index=True
     )
 
-    df["prev_country"] = (
-        df.groupby("user_id")["country"].shift(1)
+    last_batch = df["batch_id"].max()
+
+    return df, files, last_batch
+
+
+# ============================================================================
+# CHARGEMENT
+# ============================================================================
+
+df, batch_files, last_batch = load_results()
+
+
+# ============================================================================
+# AUCUNE DONNEE
+# ============================================================================
+
+if df.empty:
+
+    st.warning(
+        "⏳ En attente des résultats de Spark..."
     )
 
-    df["prev_timestamp"] = (
-        df.groupby("user_id")["timestamp"].shift(1)
+    st.write(
+        f"📂 Dossier surveillé : `{RESULTS_DIR}`"
     )
 
-    df["minutes_since_prev"] = (
-        df["timestamp"] - df["prev_timestamp"]
-    ).dt.total_seconds() / 60
+    st.write(
+        "Le dashboard attend les fichiers `batch_*.csv`."
+    )
 
-    df["impossible_travel_flag"] = (
-        (df["country"] != df["prev_country"]) &
-        (df["minutes_since_prev"] <= 20) &
-        df["prev_country"].notna()
-    ).astype(int)
+    if auto_refresh:
 
-    return df
+        time.sleep(refresh_seconds)
 
+        st.rerun()
 
-# ============================================================
-# CHARGEMENT DU MODELE
-# ============================================================
-
-@st.cache_resource
-def load_model(model_timestamp):
-    return joblib.load(MODEL_PATH)
+    st.stop()
 
 
-def load_threshold():
-    with open(THRESHOLD_PATH, "r") as f:
-        return float(f.read().strip())
+# ============================================================================
+# NETTOYAGE
+# ============================================================================
+
+if "prediction" in df.columns:
+
+    df["prediction"] = pd.to_numeric(
+        df["prediction"],
+        errors="coerce"
+    ).fillna(0).astype(int)
 
 
-@st.cache_data
-def load_test_data():
-    return add_features(
-        pd.read_csv(TEST_PATH)
+if "fraud_probability" in df.columns:
+
+    df["fraud_probability"] = pd.to_numeric(
+        df["fraud_probability"],
+        errors="coerce"
+    ).fillna(0)
+
+
+# ============================================================================
+# DETECTION DU DERNIER BATCH
+# ============================================================================
+
+last_batch_df = df[
+    df["batch_id"] == last_batch
+].copy()
+
+
+# ============================================================================
+# INDICATEUR LIVE
+# ============================================================================
+
+st.success(
+    f"🟢 PIPELINE ACTIF — Dernier batch reçu : **Batch {last_batch}**"
+)
+
+col_a, col_b, col_c = st.columns(3)
+
+with col_a:
+
+    st.metric(
+        "📦 Batches reçus",
+        len(batch_files)
+    )
+
+with col_b:
+
+    st.metric(
+        "⚡ Transactions du dernier batch",
+        len(last_batch_df)
+    )
+
+with col_c:
+
+    st.metric(
+        "🚨 Fraudes du dernier batch",
+        int(
+            (last_batch_df["prediction"] == 1).sum()
+        )
     )
 
 
-# ============================================================
-# FEATURES
-# ============================================================
+# ============================================================================
+# DERNIER BATCH
+# ============================================================================
 
-feature_columns = [
+st.divider()
+
+st.subheader(
+    f"📦 Dernier batch analysé — Batch {last_batch}"
+)
+
+st.caption(
+    f"{len(last_batch_df)} transaction(s) analysée(s) par Spark dans ce batch."
+)
+
+
+# ============================================================================
+# STATISTIQUES DU BATCH
+# ============================================================================
+
+batch_fraud_count = int(
+    (last_batch_df["prediction"] == 1).sum()
+)
+
+batch_normal_count = int(
+    (last_batch_df["prediction"] == 0).sum()
+)
+
+
+b1, b2, b3 = st.columns(3)
+
+with b1:
+
+    st.metric(
+        "Transactions",
+        len(last_batch_df)
+    )
+
+with b2:
+
+    st.metric(
+        "🚨 Fraudes",
+        batch_fraud_count
+    )
+
+with b3:
+
+    st.metric(
+        "✅ Normales",
+        batch_normal_count
+    )
+
+
+# ============================================================================
+# TRANSACTIONS DU DERNIER BATCH
+# ============================================================================
+
+display_df = last_batch_df.copy()
+
+if show_only_fraud:
+
+    display_df = display_df[
+        display_df["prediction"] == 1
+    ]
+
+
+display_columns = [
+    "transaction_id",
+    "user_id",
+    "timestamp",
     "amount",
-    "hour_of_day",
-    "is_night",
-    "ip_is_datacenter",
+    "country",
+    "merchant_category",
     "velocity_count_5min",
     "impossible_travel_flag",
-    "country",
-    "merchant_category"
+    "fraud_probability",
+    "prediction_label"
 ]
 
 
-# ============================================================
-# CHARGEMENT
-# ============================================================
-
-model_timestamp = os.path.getmtime(MODEL_PATH)
-
-model = load_model(model_timestamp)
-
-best_threshold = load_threshold()
-
-test_df = load_test_data()
-
-X_test = test_df[feature_columns]
-
-y_test = test_df["is_fraud"]
-
-y_proba = model.predict_proba(X_test)[:, 1]
+display_columns = [
+    c
+    for c in display_columns
+    if c in display_df.columns
+]
 
 
-# ============================================================
-# TITRE
-# ============================================================
+display_df = display_df[
+    display_columns
+].iloc[::-1]
 
-st.title("🔍 Dashboard - Détection de fraude en temps réel")
 
-st.info(
-    f"🎯 **Seuil optimisé utilisé par le modèle final : "
-    f"{best_threshold:.3f}**"
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True
 )
 
 
-# ============================================================
-# SIDEBAR
-# ============================================================
+# ============================================================================
+# DERNIERE TRANSACTION DU BATCH
+# ============================================================================
 
-st.sidebar.header("Réglages")
+st.divider()
 
-st.sidebar.success(
-    f"Seuil optimisé : **{best_threshold:.3f}**"
+st.subheader(
+    "⚡ Dernière transaction analysée"
 )
 
-threshold = st.sidebar.slider(
-    "Seuil de décision",
-    min_value=0.0,
-    max_value=1.0,
-    value=float(best_threshold),
-    step=0.01
-)
+last = last_batch_df.iloc[-1]
 
-if abs(threshold - best_threshold) < 0.005:
-    st.sidebar.caption(
-        "✅ Seuil officiel optimisé sur la validation"
+
+if last["prediction"] == 1:
+
+    st.error(
+        f"""
+🚨 **FRAUDE DÉTECTÉE**
+
+**Transaction :** `{last["transaction_id"]}`
+
+**Utilisateur :** `{last["user_id"]}`
+
+**Montant :** `{last["amount"]:.2f}`
+
+**Pays :** `{last["country"]}`
+
+**Probabilité de fraude :** `{last["fraud_probability"]:.2%}`
+"""
     )
+
 else:
-    st.sidebar.warning(
-        "⚠️ Seuil de simulation différent du seuil optimisé"
+
+    st.success(
+        f"""
+✅ **TRANSACTION NORMALE**
+
+**Transaction :** `{last["transaction_id"]}`
+
+**Utilisateur :** `{last["user_id"]}`
+
+**Montant :** `{last["amount"]:.2f}`
+
+**Pays :** `{last["country"]}`
+
+**Probabilité de fraude :** `{last["fraud_probability"]:.2%}`
+"""
     )
 
 
-# ============================================================
-# PREDICTIONS
-# ============================================================
+# ============================================================================
+# INDICATEURS CRITIQUES
+# ============================================================================
 
-y_pred = (
-    y_proba >= threshold
-).astype(int)
-
-
-# ============================================================
-# METRIQUES
-# ============================================================
-
-col1, col2, col3, col4 = st.columns(4)
-
-col1.metric(
-    "Accuracy",
-    f"{accuracy_score(y_test, y_pred):.1%}"
-)
-
-col2.metric(
-    "Precision",
-    f"{precision_score(y_test, y_pred, zero_division=0):.1%}"
-)
-
-col3.metric(
-    "Recall",
-    f"{recall_score(y_test, y_pred, zero_division=0):.1%}"
-)
-
-col4.metric(
-    "F1-score",
-    f"{f1_score(y_test, y_pred, zero_division=0):.1%}"
-)
-
-
-# ============================================================
-# MATRICE DE CONFUSION + COURBE
-# ============================================================
-
-col_left, col_right = st.columns(2)
-
-
-# ------------------------------------------------------------
-# Matrice de confusion
-# ------------------------------------------------------------
-
-with col_left:
-
-    st.subheader("Matrice de confusion")
-
-    cm = confusion_matrix(
-        y_test,
-        y_pred
-    )
-
-    fig, ax = plt.subplots(
-        figsize=(4, 3.5)
-    )
-
-    sns.heatmap(
-        cm,
-        annot=True,
-        fmt="d",
-        cmap="Blues",
-        xticklabels=["Normal", "Fraude"],
-        yticklabels=["Normal", "Fraude"],
-        ax=ax
-    )
-
-    ax.set_xlabel("Prédiction")
-    ax.set_ylabel("Réalité")
-
-    st.pyplot(fig)
-
-
-# ------------------------------------------------------------
-# Precision / Recall selon le seuil
-# ------------------------------------------------------------
-
-with col_right:
-
-    st.subheader(
-        "Courbe Precision / Recall selon le seuil"
-    )
-
-    precisions, recalls, thresholds = (
-        precision_recall_curve(
-            y_test,
-            y_proba
-        )
-    )
-
-    fig2, ax2 = plt.subplots(
-        figsize=(4, 3.5)
-    )
-
-    ax2.plot(
-        thresholds,
-        precisions[:-1],
-        label="Precision"
-    )
-
-    ax2.plot(
-        thresholds,
-        recalls[:-1],
-        label="Recall"
-    )
-
-    # Seuil optimisé
-    ax2.axvline(
-        best_threshold,
-        linestyle="--",
-        label=f"Seuil optimisé ({best_threshold:.3f})"
-    )
-
-    # Seuil actuellement sélectionné
-    if abs(threshold - best_threshold) > 0.005:
-
-        ax2.axvline(
-            threshold,
-            linestyle=":",
-            label=f"Seuil testé ({threshold:.2f})"
-        )
-
-    ax2.set_xlabel("Seuil")
-
-    ax2.set_ylabel("Score")
-
-    ax2.legend()
-
-    st.pyplot(fig2)
-
-
-# ============================================================
-# IMPORTANCE DES FEATURES
-# ============================================================
+st.divider()
 
 st.subheader(
-    "Importance des features dans la décision du modèle"
+    "🔎 Indicateurs comportementaux"
 )
 
-classifier = model.named_steps["classifier"]
-
-preprocessor = model.named_steps["preprocessor"]
-
-cat_names = (
-    preprocessor
-    .named_transformers_["cat"]
-    .get_feature_names_out(
-        ["country", "merchant_category"]
-    )
-)
-
-all_feature_names = [
-    "amount",
-    "hour_of_day",
-    "is_night",
-    "ip_is_datacenter",
-    "velocity_count_5min",
-    "impossible_travel_flag"
-] + list(cat_names)
-
-importances = pd.Series(
-    classifier.feature_importances_,
-    index=all_feature_names
-)
-
-importances = (
-    importances
-    .sort_values(ascending=False)
-    .head(10)
-)
-
-fig3, ax3 = plt.subplots(
-    figsize=(8, 4)
-)
-
-importances.plot(
-    kind="barh",
-    ax=ax3
-)
-
-ax3.invert_yaxis()
-
-st.pyplot(fig3)
+c1, c2, c3, c4 = st.columns(4)
 
 
-# ============================================================
-# TEST MANUEL
-# ============================================================
+with c1:
 
-st.subheader(
-    "Tester une transaction manuellement"
-)
-
-c1, c2, c3 = st.columns(3)
-
-amount = c1.number_input(
-    "Montant (TND)",
-    value=200.0
-)
-
-hour = c2.slider(
-    "Heure",
-    0,
-    23,
-    14
-)
-
-velocity = c3.number_input(
-    "Nb transactions récentes (5 min)",
-    value=1,
-    min_value=1
-)
-
-country = c1.text_input(
-    "Pays",
-    "TN"
-)
-
-category = c2.text_input(
-    "Catégorie marchand",
-    "grocery"
-)
-
-is_dc = c3.checkbox(
-    "IP datacenter suspecte"
-)
-
-impossible = c1.checkbox(
-    "Voyage impossible détecté"
-)
-
-
-if st.button("Prédire"):
-
-    sample = pd.DataFrame([{
-
-        "amount": amount,
-
-        "hour_of_day": hour,
-
-        "is_night": (
-            1 if hour < 5 else 0
-        ),
-
-        "ip_is_datacenter": int(is_dc),
-
-        "velocity_count_5min": velocity,
-
-        "impossible_travel_flag": int(impossible),
-
-        "country": country,
-
-        "merchant_category": category
-
-    }])
-
-    proba = model.predict_proba(
-        sample
-    )[0, 1]
-
-    st.write(
-        f"**Probabilité de fraude : "
-        f"{proba:.1%}**"
+    st.metric(
+        "💰 Montant",
+        f'{last["amount"]:.2f}'
     )
 
-    st.write(
-        f"Seuil utilisé : "
-        f"**{threshold:.3f}**"
+
+with c2:
+
+    velocity = last.get(
+        "velocity_count_5min",
+        0
     )
 
-    if proba >= threshold:
+    st.metric(
+        "⚡ Transactions / 5 min",
+        int(velocity)
+    )
+
+
+with c3:
+
+    impossible = last.get(
+        "impossible_travel_flag",
+        0
+    )
+
+    if int(impossible) == 1:
 
         st.error(
-            "🚨 Transaction classée FRAUDE"
+            "🌍 Voyage impossible"
         )
 
     else:
 
         st.success(
-            "✅ Transaction classée NORMALE"
+            "🌍 Voyage normal"
         )
+
+
+with c4:
+
+    ip_dc = last.get(
+        "ip_is_datacenter",
+        0
+    )
+
+    if int(ip_dc) == 1:
+
+        st.warning(
+            "🖥️ IP Datacenter"
+        )
+
+    else:
+
+        st.success(
+            "🌐 IP classique"
+        )
+
+
+# ============================================================================
+# PROBABILITE
+# ============================================================================
+
+st.subheader(
+    "🎯 Probabilité de fraude"
+)
+
+probability = float(
+    last["fraud_probability"]
+)
+
+st.progress(
+    min(
+        max(probability, 0),
+        1
+    )
+)
+
+st.write(
+    f"Probabilité : **{probability:.2%}**"
+)
+
+
+# ============================================================================
+# HISTORIQUE COMPLET
+# ============================================================================
+
+st.divider()
+
+st.subheader(
+    "📚 Historique des transactions"
+)
+
+history_df = df.copy()
+
+if show_only_fraud:
+
+    history_df = history_df[
+        history_df["prediction"] == 1
+    ]
+
+
+history_columns = [
+    "batch_id",
+    "transaction_id",
+    "user_id",
+    "timestamp",
+    "amount",
+    "country",
+    "merchant_category",
+    "velocity_count_5min",
+    "impossible_travel_flag",
+    "fraud_probability",
+    "prediction_label"
+]
+
+
+history_columns = [
+    c
+    for c in history_columns
+    if c in history_df.columns
+]
+
+
+history_df = history_df[
+    history_columns
+].tail(100).iloc[::-1]
+
+
+st.dataframe(
+    history_df,
+    use_container_width=True,
+    hide_index=True
+)
+
+
+# ============================================================================
+# FRAUDES RECENTES
+# ============================================================================
+
+st.divider()
+
+st.subheader(
+    "🚨 Fraudes détectées récemment"
+)
+
+frauds = df[
+    df["prediction"] == 1
+].copy()
+
+
+if frauds.empty:
+
+    st.info(
+        "Aucune fraude détectée pour le moment."
+    )
+
+else:
+
+    frauds = frauds.tail(10).iloc[::-1]
+
+    fraud_columns = [
+        "batch_id",
+        "transaction_id",
+        "user_id",
+        "timestamp",
+        "amount",
+        "country",
+        "velocity_count_5min",
+        "impossible_travel_flag",
+        "fraud_probability",
+        "prediction_label"
+    ]
+
+    fraud_columns = [
+        c
+        for c in fraud_columns
+        if c in frauds.columns
+    ]
+
+    st.dataframe(
+        frauds[fraud_columns],
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+# ============================================================================
+# EVOLUTION
+# ============================================================================
+
+st.divider()
+
+st.subheader(
+    "📈 Évolution des prédictions"
+)
+
+chart_df = (
+    df
+    .groupby("batch_id")
+    .agg(
+        Transactions=("prediction", "count"),
+        Fraudes=("prediction", "sum")
+    )
+    .reset_index()
+)
+
+
+st.line_chart(
+    chart_df.set_index("batch_id")
+)
+
+
+# ============================================================================
+# PIPELINE
+# ============================================================================
+
+st.divider()
+
+st.subheader(
+    "🔗 Pipeline temps réel"
+)
+
+p1, p2, p3, p4 = st.columns(4)
+
+with p1:
+    st.success("🟢 Kafka\n\ntransactions")
+
+with p2:
+    st.success("🟢 Spark\n\nStreaming")
+
+with p3:
+    st.success("🟢 Random Forest\n\nPrediction")
+
+with p4:
+    st.success(
+        f"🟢 Dashboard\n\nBatch {last_batch}"
+    )
+
+
+# ============================================================================
+# AUTO REFRESH
+# ============================================================================
+
+if auto_refresh:
+
+    time.sleep(
+        refresh_seconds
+    )
+
+    st.rerun()
